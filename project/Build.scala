@@ -1,7 +1,7 @@
+import sbt.Keys._
 import sbt._
-import Keys._
+import sbtassembly.Plugin.AssemblyKeys._
 import sbtassembly.Plugin._
-import AssemblyKeys._
 
 object KafkaUtilsBuild extends Build {
 
@@ -32,11 +32,11 @@ object KafkaUtilsBuild extends Build {
 
   def offsetmonSettings = sharedSettings ++ Seq(
     mergeStrategy in assembly := {
-     case "about.html"                                => MergeStrategy.discard
-     case x =>
-		val oldStrategy = (mergeStrategy in assembly).value
-    		oldStrategy(x)
-	},
+      case "about.html" => MergeStrategy.discard
+      case x =>
+        val oldStrategy = (mergeStrategy in assembly).value
+        oldStrategy(x)
+    },
     name := "KafkaOffsetMonitor",
     libraryDependencies ++= Seq(
       "net.databinder" %% "unfiltered-filter" % "0.8.4",
@@ -46,7 +46,8 @@ object KafkaUtilsBuild extends Build {
       "com.typesafe.slick" %% "slick" % "2.0.0",
       "org.xerial" % "sqlite-jdbc" % "3.7.2",
       "com.twitter" % "util-core" % "3.0.0",
-      "org.reflections" % "reflections" % "0.9.10"),
+      "org.reflections" % "reflections" % "0.9.10",
+      "org.apache.kafka" %% "kafka" % "0.8.2.1"),
     resolvers ++= Seq(
       "java m2" at "http://download.java.net/maven/2",
       "twitter repo" at "http://maven.twttr.com"))

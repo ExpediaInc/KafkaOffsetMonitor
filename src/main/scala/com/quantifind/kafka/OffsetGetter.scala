@@ -18,23 +18,30 @@ import scala.util.control.NonFatal
 case class Node(name: String, children: Seq[Node] = Seq())
 
 case class TopicDetails(consumers: Seq[ConsumerDetail])
+
 case class TopicDetailsWrapper(consumers: TopicDetails)
 
 case class TopicAndConsumersDetails(active: Seq[KafkaInfo], inactive: Seq[KafkaInfo])
+
 case class TopicAndConsumersDetailsWrapper(consumers: TopicAndConsumersDetails)
 
 case class ConsumerDetail(name: String)
 
-trait OffsetGetter  extends Logging {
+trait OffsetGetter extends Logging {
 
   val consumerMap: mutable.Map[Int, Option[SimpleConsumer]] = mutable.Map()
+
   def zkClient: ZkClient
 
   //  kind of interface methods
   def getTopicList(group: String): List[String]
+
   def getGroups: Seq[String]
+
   def getTopicMap: Map[String, Seq[String]]
+
   def getActiveTopicMap: Map[String, Seq[String]]
+
   def processPartition(group: String, topic: String, pid: Int): Option[OffsetInfo]
 
   // get the Kafka simple consumer so that we can fetch broker offsets
@@ -120,8 +127,8 @@ trait OffsetGetter  extends Logging {
   }
 
   /**
-   * Returns details for a given topic such as the consumers pulling off of it
-   */
+    * Returns details for a given topic such as the consumers pulling off of it
+    */
   def getTopicDetail(topic: String): TopicDetails = {
     val topicMap = getActiveTopicMap
 
@@ -138,17 +145,17 @@ trait OffsetGetter  extends Logging {
     consumers.map(consumer => ConsumerDetail(consumer.toString))
 
   /**
-   * Returns details for a given topic such as the active consumers pulling off of it
-   * and for each of the active consumers it will return the consumer data
-   */
+    * Returns details for a given topic such as the active consumers pulling off of it
+    * and for each of the active consumers it will return the consumer data
+    */
   def getTopicAndConsumersDetail(topic: String): TopicAndConsumersDetailsWrapper = {
     val topicMap = getTopicMap
     val activeTopicMap = getActiveTopicMap
 
     val activeConsumers = if (activeTopicMap.contains(topic)) {
-        mapConsumersToKafkaInfo(activeTopicMap(topic), topic)
+      mapConsumersToKafkaInfo(activeTopicMap(topic), topic)
     } else {
-        Seq()
+      Seq()
     }
 
     val inactiveConsumers = if (!activeTopicMap.contains(topic) && topicMap.contains(topic)) {
