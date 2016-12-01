@@ -1,35 +1,51 @@
 package com.quantifind.kafka
 
-import scala.collection._
+import java.util.Properties
+import java.util.concurrent.atomic.AtomicBoolean
 
 import com.quantifind.kafka.OffsetGetter.{BrokerInfo, KafkaInfo, OffsetInfo}
-import kafka.api.{OffsetRequest, PartitionOffsetRequestInfo}
-import kafka.common.{BrokerNotAvailableException, TopicAndPartition}
-import kafka.consumer.SimpleConsumer
-import kafka.utils.{Json, Logging, ZkUtils}
-import org.I0Itec.zkclient.ZkClient
-import org.I0Itec.zkclient.exception.ZkNoNodeException
+import com.quantifind.kafka.core.{KafkaOffsetGetter, StormOffsetGetter, ZKOffsetGetter}
+import com.quantifind.kafka.offsetapp.OffsetGetterArgs
 import com.twitter.util.Time
-import org.apache.zookeeper.data.Stat
-import scala.util.control.NonFatal
+import kafka.common.BrokerNotAvailableException
+import kafka.consumer.{Consumer, ConsumerConfig, ConsumerConnector, SimpleConsumer}
+import kafka.utils.{Json, Logging, ZKStringSerializer, ZkUtils}
+import org.I0Itec.zkclient.ZkClient
 
-/**
- * a nicer version of kafka's ConsumerOffsetChecker tool
- * User: pierre
- * Date: 1/22/14
- */
+import scala.collection._
+import scala.util.control.NonFatal
 
 case class Node(name: String, children: Seq[Node] = Seq())
 
 case class TopicDetails(consumers: Seq[ConsumerDetail])
 
+case class TopicDetailsWrapper(consumers: TopicDetails)
+
+case class TopicAndConsumersDetails(active: Seq[KafkaInfo], inactive: Seq[KafkaInfo])
+
+case class TopicAndConsumersDetailsWrapper(consumers: TopicAndConsumersDetails)
+
 case class ConsumerDetail(name: String)
 
-class OffsetGetter(zkClient: ZkClient) extends Logging {
+trait OffsetGetter extends Logging {
 
-  private val consumerMap: mutable.Map[Int, Option[SimpleConsumer]] = mutable.Map()
+  val consumerMap: mutable.Map[Int, Option[SimpleConsumer]] = mutable.Map()
 
-  private def getConsumer(bid: Int): Option[SimpleConsumer] = {
+  def zkClient: ZkClient
+
+  //  kind of interface methods
+  def getTopicList(group: String): List[String]
+
+  def getGroups: Seq[String]
+
+  def getTopicMap: Map[String, Seq[String]]
+
+  def getActiveTopicMap: Map[String, Seq[String]]
+
+  def processPartition(group: String, topic: String, pid: Int): Option[OffsetInfo]
+
+  // get the Kafka simple consumer so that we can fetch broker offsets
+  protected def getConsumer(bid: Int): Option[SimpleConsumer] = {
     try {
       ZkUtils.readDataMaybeNull(zkClient, ZkUtils.BrokerIdsPath + "/" + bid) match {
         case (Some(brokerInfoString), _) =>
@@ -52,42 +68,7 @@ class OffsetGetter(zkClient: ZkClient) extends Logging {
     }
   }
 
-  private def processPartition(group: String, topic: String, pid: Int): Option[OffsetInfo] = {
-    try {
-      val (offset, stat: Stat) = ZkUtils.readData(zkClient, s"${ZkUtils.ConsumersPath}/$group/offsets/$topic/$pid")
-      val (owner, _) = ZkUtils.readDataMaybeNull(zkClient, s"${ZkUtils.ConsumersPath}/$group/owners/$topic/$pid")
-
-      ZkUtils.getLeaderForPartition(zkClient, topic, pid) match {
-        case Some(bid) =>
-          val consumerOpt = consumerMap.getOrElseUpdate(bid, getConsumer(bid))
-          consumerOpt map {
-            consumer =>
-              val topicAndPartition = TopicAndPartition(topic, pid)
-              val request =
-                OffsetRequest(immutable.Map(topicAndPartition -> PartitionOffsetRequestInfo(OffsetRequest.LatestTime, 1)))
-              val logSize = consumer.getOffsetsBefore(request).partitionErrorAndOffsets(topicAndPartition).offsets.head
-
-              OffsetInfo(group = group,
-                topic = topic,
-                partition = pid,
-                offset = offset.toLong,
-                logSize = logSize,
-                owner = owner,
-                creation = Time.fromMilliseconds(stat.getCtime),
-                modified = Time.fromMilliseconds(stat.getMtime))
-          }
-        case None =>
-          error("No broker for partition %s - %s".format(topic, pid))
-          None
-      }
-    } catch {
-      case NonFatal(t) =>
-        error(s"Could not parse partition info. group: [$group] topic: [$topic]", t)
-        None
-    }
-  }
-
-  private def processTopic(group: String, topic: String): Seq[OffsetInfo] = {
+  protected def processTopic(group: String, topic: String): Seq[OffsetInfo] = {
     val pidMap = ZkUtils.getPartitionsForTopics(zkClient, Seq(topic))
     for {
       partitions <- pidMap.get(topic).toSeq
@@ -96,53 +77,58 @@ class OffsetGetter(zkClient: ZkClient) extends Logging {
     } yield info
   }
 
-  private def brokerInfo(): Iterable[BrokerInfo] = {
+  protected def brokerInfo(): Iterable[BrokerInfo] = {
     for {
       (bid, consumerOpt) <- consumerMap
       consumer <- consumerOpt
     } yield BrokerInfo(id = bid, host = consumer.host, port = consumer.port)
   }
 
-  private def offsetInfo(group: String, topics: Seq[String] = Seq()): Seq[OffsetInfo] = {
+  protected def offsetInfo(group: String, topics: Seq[String] = Seq()): Seq[OffsetInfo] = {
 
     val topicList = if (topics.isEmpty) {
-      try {
-        ZkUtils.getChildren(
-          zkClient, s"${ZkUtils.ConsumersPath}/$group/offsets").toSeq
-      } catch {
-        case _: ZkNoNodeException => Seq()
-      }
+      getTopicList(group)
     } else {
       topics
     }
+
     topicList.sorted.flatMap(processTopic(group, _))
   }
 
+
+  // get information about a consumer group and the topics it consumes
   def getInfo(group: String, topics: Seq[String] = Seq()): KafkaInfo = {
     val off = offsetInfo(group, topics)
     val brok = brokerInfo()
     KafkaInfo(
+      name = group,
       brokers = brok.toSeq,
       offsets = off
     )
   }
 
-  def getGroups: Seq[String] = {
+  // get list of all topics
+  def getTopics: Seq[String] = {
     try {
-      ZkUtils.getChildren(zkClient, ZkUtils.ConsumersPath)
+      ZkUtils.getChildren(zkClient, ZkUtils.BrokerTopicsPath).sortWith(_ < _)
     } catch {
       case NonFatal(t) =>
-        error(s"could not get groups because of ${t.getMessage}", t)
+        error(s"could not get topics because of ${t.getMessage}", t)
         Seq()
+
     }
   }
 
+  def getClusterViz: Node = {
+    val clusterNodes = ZkUtils.getAllBrokersInCluster(zkClient).map((broker) => {
+      Node(broker.connectionString, Seq())
+    })
+    Node("KafkaCluster", clusterNodes)
+  }
 
   /**
-   * returns details for a given topic such as the active consumers pulling off of it
-   * @param topic
-   * @return
-   */
+    * Returns details for a given topic such as the consumers pulling off of it
+    */
   def getTopicDetail(topic: String): TopicDetails = {
     val topicMap = getActiveTopicMap
 
@@ -155,46 +141,37 @@ class OffsetGetter(zkClient: ZkClient) extends Logging {
     }
   }
 
-  def getTopics: Seq[String] = {
-    try {
-      ZkUtils.getChildren(zkClient, ZkUtils.BrokerTopicsPath).sortWith(_ < _)
-    } catch {
-      case NonFatal(t) =>
-        error(s"could not get topics because of ${t.getMessage}", t)
-        Seq()
-
-    }
-  }
-
+  def mapConsumerDetails(consumers: Seq[String]): Seq[ConsumerDetail] =
+    consumers.map(consumer => ConsumerDetail(consumer.toString))
 
   /**
-   * returns a map of active topics-> list of consumers from zookeeper, ones that have IDS attached to them
-   *
-   * @return
-   */
-  def getActiveTopicMap: Map[String, Seq[String]] = {
-    try {
-      ZkUtils.getChildren(zkClient, ZkUtils.ConsumersPath).flatMap {
-        group =>
-          try {
-            ZkUtils.getConsumersPerTopic(zkClient, group).keySet.map {
-              key =>
-                key -> group
-            }
-          } catch {
-            case NonFatal(t) =>
-              error(s"could not get consumers for group $group", t)
-              Seq()
-          }
-      }.groupBy(_._1).mapValues {
-        _.unzip._2
-      }
-    } catch {
-      case NonFatal(t) =>
-        error(s"could not get topic maps because of ${t.getMessage}", t)
-        Map()
+    * Returns details for a given topic such as the active consumers pulling off of it
+    * and for each of the active consumers it will return the consumer data
+    */
+  def getTopicAndConsumersDetail(topic: String): TopicAndConsumersDetailsWrapper = {
+    val topicMap = getTopicMap
+    val activeTopicMap = getActiveTopicMap
+
+    val activeConsumers = if (activeTopicMap.contains(topic)) {
+      mapConsumersToKafkaInfo(activeTopicMap(topic), topic)
+    } else {
+      Seq()
     }
+
+    val inactiveConsumers = if (!activeTopicMap.contains(topic) && topicMap.contains(topic)) {
+      mapConsumersToKafkaInfo(topicMap(topic), topic)
+    } else if (activeTopicMap.contains(topic) && topicMap.contains(topic)) {
+      mapConsumersToKafkaInfo(topicMap(topic).diff(activeTopicMap(topic)), topic)
+    } else {
+      Seq()
+    }
+
+    TopicAndConsumersDetailsWrapper(TopicAndConsumersDetails(activeConsumers, inactiveConsumers))
   }
+
+  def mapConsumersToKafkaInfo(consumers: Seq[String], topic: String): Seq[KafkaInfo] =
+    consumers.map(getInfo(_, Seq(topic)))
+
 
   def getActiveTopics: Node = {
     val topicMap = getActiveTopicMap
@@ -207,13 +184,6 @@ class OffsetGetter(zkClient: ZkClient) extends Logging {
     }.toSeq)
   }
 
-  def getClusterViz: Node = {
-    val clusterNodes = ZkUtils.getAllBrokersInCluster(zkClient).map((broker) => {
-      Node(broker.getConnectionString(), Seq())
-    })
-    Node("KafkaCluster", clusterNodes)
-  }
-
   def close() {
     for (consumerOpt <- consumerMap.values) {
       consumerOpt match {
@@ -222,12 +192,11 @@ class OffsetGetter(zkClient: ZkClient) extends Logging {
       }
     }
   }
-
 }
 
 object OffsetGetter {
 
-  case class KafkaInfo(brokers: Seq[BrokerInfo], offsets: Seq[OffsetInfo])
+  case class KafkaInfo(name: String, brokers: Seq[BrokerInfo], offsets: Seq[OffsetInfo])
 
   case class BrokerInfo(id: Int, host: String, port: Int)
 
@@ -242,4 +211,48 @@ object OffsetGetter {
     val lag = logSize - offset
   }
 
+  val kafkaOffsetListenerStarted: AtomicBoolean = new AtomicBoolean(false)
+  var zkClient: ZkClient = null
+  var consumerConnector: ConsumerConnector = null
+
+  def createZKClient(args: OffsetGetterArgs): ZkClient = {
+    new ZkClient(args.zk,
+      args.zkSessionTimeout.toMillis.toInt,
+      args.zkConnectionTimeout.toMillis.toInt,
+      ZKStringSerializer)
+  }
+
+  def createKafkaConsumerConnector(args: OffsetGetterArgs): ConsumerConnector = {
+    val props: Properties = new Properties()
+    // we want to be unique
+    props.put("group.id", "KafkaOffsetMonitor-" + System.currentTimeMillis)
+    props.put("zookeeper.connect", args.zk)
+    // must enable it
+    props.put("exclude.internal.topics", "false")
+    // we don't want to commit any thing, will always start from latest
+    props.put("auto.commit.enable", "false")
+    props.put("auto.offset.reset", if (args.kafkaOffsetForceFromStart) "smallest" else "largest")
+
+    Consumer.create(new ConsumerConfig(props))
+  }
+
+  def getInstance(args: OffsetGetterArgs): OffsetGetter = {
+
+    if (kafkaOffsetListenerStarted.compareAndSet(false, true)) {
+      zkClient = createZKClient(args)
+      if (args.offsetStorage.toLowerCase == "kafka") {
+        consumerConnector = createKafkaConsumerConnector(args)
+        KafkaOffsetGetter.startOffsetListener(consumerConnector)
+      }
+    }
+
+    args.offsetStorage.toLowerCase match {
+      case "kafka" =>
+        new KafkaOffsetGetter(zkClient)
+      case "storm" =>
+        new StormOffsetGetter(zkClient, args.stormZKOffsetBase)
+      case _ =>
+        new ZKOffsetGetter(zkClient)
+    }
+  }
 }
