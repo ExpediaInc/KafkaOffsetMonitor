@@ -106,7 +106,7 @@ As long as this is true you will need to use local maven repo and just publish K
 Assuming you have a custom implementation of OffsetInfoReporter in a jar file, running it is as simple as adding the jar to the classpath when running app:
 
 ```
-java -cp KafkaOffsetMonitor-assembly-0.3.0.jar:kafka-offset-monitor-another-db-reporter.jar \
+java -cp KafkaOffsetMonitor-assembly-0.3.1.jar:kafka-offset-monitor-another-db-reporter.jar \
      com.quantifind.kafka.offsetapp.OffsetGetterWeb \
      --zk zk-server1,zk-server2 \
      --port 8080 \

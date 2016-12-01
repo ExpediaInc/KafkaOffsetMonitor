@@ -1,12 +1,12 @@
-import sbt.Keys._
 import sbt._
-import sbtassembly.Plugin.AssemblyKeys._
+import Keys._
 import sbtassembly.Plugin._
+import AssemblyKeys._
 
 object KafkaUtilsBuild extends Build {
 
   def sharedSettings = Defaults.defaultSettings ++ assemblySettings ++ Seq(
-    version := "0.3.0-SNAPSHOT",
+    version := "0.3.1",
     scalaVersion := "2.10.3",
     organization := "com.quantifind",
     scalacOptions := Seq("-deprecation", "-unchecked", "-optimize"),
